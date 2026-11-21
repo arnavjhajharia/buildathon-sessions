@@ -1,0 +1,16 @@
+# The same image, built from source. The root Dockerfile ships the binary that
+# scripts/build-bin.sh makes from this source with the same toolchain and flags.
+FROM rust:1-slim-bookworm AS build
+RUN rustup toolchain install 1.100.0 --profile minimal \
+ && rustup target add --toolchain 1.100.0 x86_64-unknown-linux-musl
+WORKDIR /src
+COPY Cargo.toml ./
+COPY src ./src
+RUN RUSTFLAGS="-C linker=rust-lld -C target-cpu=x86-64-v3" \
+    cargo +1.100.0 build --release --target x86_64-unknown-linux-musl \
+ && cp target/x86_64-unknown-linux-musl/release/sessions /sessions
+
+FROM scratch
+COPY --from=build /sessions /sessions
+USER 1000:1000
+CMD ["/sessions"]

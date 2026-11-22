@@ -292,8 +292,13 @@ pub fn run_fast(inp: &Inputs) -> Result<(), TooLong> {
 
     // ---- dedup events by event_id; scatter valid winners by person
     let next = AtomicUsize::new(0);
+    // Pre-size the outputs (each worker sees about 1/t of the survivors, spread
+    // over P partitions) so they rarely grow: growth remaps pages under the
+    // process-wide mmap lock and stalls the other threads' page faults.
+    let n_ev: usize = parsed.iter().map(|w| w.0.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let out_cap = n_ev / t / P + n_ev / t / P / 8 + 16;
     let sess_in: Vec<Vec<Vec<SRec>>> = par_map(t, |_| {
-        let mut out: Vec<Vec<SRec>> = (0..P).map(|_| Vec::new()).collect();
+        let mut out: Vec<Vec<SRec>> = (0..P).map(|_| Vec::with_capacity(out_cap)).collect();
         let mut table: Vec<u32> = Vec::new();
         let mut buf: Vec<ERec> = Vec::new();
         loop {

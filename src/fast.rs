@@ -19,10 +19,49 @@ pub fn pack(b: &[u8]) -> Option<Id> {
     if n > 15 {
         return None;
     }
-    let mut a = [0u8; 16];
-    a[..n].copy_from_slice(b);
-    a[15] = n as u8;
-    Some([u64::from_be_bytes(a[0..8].try_into().unwrap()), u64::from_be_bytes(a[8..16].try_into().unwrap())])
+    // Shift-or instead of a variable-length copy: the copy compiled to a
+    // memcpy call that showed up at 18% of the 20M profile.
+    let mut hi = 0u64;
+    let mut lo = n as u64;
+    let mut j = 0;
+    while j < n && j < 8 {
+        hi |= (b[j] as u64) << (56 - 8 * j);
+        j += 1;
+    }
+    while j < n {
+        lo |= (b[j] as u64) << (56 - 8 * (j - 8));
+        j += 1;
+    }
+    Some([hi, lo])
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pack_matches_bytes() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        for _ in 0..20000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 17) as usize;
+            let b: Vec<u8> = (0..n).map(|i| (x >> ((i * 3) % 56)) as u8).collect();
+            let want = if n > 15 {
+                None
+            } else {
+                let mut a = [0u8; 16];
+                a[..n].copy_from_slice(&b);
+                a[15] = n as u8;
+                Some([u64::from_be_bytes(a[0..8].try_into().unwrap()), u64::from_be_bytes(a[8..16].try_into().unwrap())])
+            };
+            assert_eq!(super::pack(&b), want);
+            if let Some(id) = want {
+                let mut out = Vec::new();
+                super::unpack(id, &mut out);
+                assert_eq!(out, b);
+            }
+        }
+    }
 }
 
 pub fn unpack(id: Id, out: &mut Vec<u8>) {

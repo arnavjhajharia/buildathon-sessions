@@ -227,3 +227,158 @@ mod tests {
         assert_eq!(parse_price(b"10000000"), Some(10_000_000));
     }
 }
+
+// ------------------------------------------------------------ fast scanner
+
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+#[inline(always)]
+fn zero_bytes(v: u64) -> u64 {
+    v.wrapping_sub(LO) & !v & HI
+}
+
+/// Index of the first ',', '\n' or '"' at or after `i`, or `d.len()`.
+#[inline(always)]
+pub fn find_special(d: &[u8], mut i: usize) -> usize {
+    let n = d.len();
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
+        let m = zero_bytes(w ^ (LO * b',' as u64)) | zero_bytes(w ^ (LO * b'\n' as u64)) | zero_bytes(w ^ (LO * b'"' as u64));
+        if m != 0 {
+            return i + (m.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n {
+        let b = d[i];
+        if b == b',' || b == b'\n' || b == b'"' {
+            return i;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Index of the first '\n' at or after `i`, or `d.len()`.
+#[inline(always)]
+pub fn find_nl(d: &[u8], mut i: usize) -> usize {
+    let n = d.len();
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
+        let m = zero_bytes(w ^ (LO * b'\n' as u64));
+        if m != 0 {
+            return i + (m.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n {
+        if d[i] == b'\n' {
+            return i;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Calls `f` with the N unquoted fields of every well-formed line of `d`
+/// (`d` holds whole lines; the last may lack its '\n'). Same dialect as `split`.
+#[inline(always)]
+pub fn scan<const N: usize>(d: &'static [u8], mut f: impl FnMut([&'static [u8]; N])) {
+    let n = d.len();
+    let mut i = 0usize;
+    'lines: while i < n {
+        let mut out: [&'static [u8]; N] = [&[]; N];
+        let mut k = 0;
+        loop {
+            let (s, e);
+            if i < n && d[i] == b'"' {
+                let j = find_special(d, i + 1);
+                if j >= n || d[j] != b'"' {
+                    i = find_nl(d, i) + 1;
+                    continue 'lines;
+                }
+                s = i + 1;
+                e = j;
+                i = j + 1;
+            } else {
+                let j = find_special(d, i);
+                if j < n && d[j] == b'"' {
+                    i = find_nl(d, j) + 1;
+                    continue 'lines;
+                }
+                s = i;
+                e = j;
+                i = j;
+            }
+            out[k] = &d[s..e];
+            k += 1;
+            if k < N {
+                if i < n && d[i] == b',' {
+                    i += 1;
+                } else {
+                    // Too few fields, or a quoted field followed by junk.
+                    i = if i < n && d[i] == b'\n' { i + 1 } else { find_nl(d, i) + 1 };
+                    continue 'lines;
+                }
+            } else {
+                if i >= n || d[i] == b'\n' {
+                    i += 1;
+                    f(out);
+                } else {
+                    i = find_nl(d, i) + 1;
+                }
+                continue 'lines;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    fn collect<const N: usize>(s: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        scan::<N>(s, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        v
+    }
+    #[test]
+    fn scan_matches_split() {
+        let text: &'static [u8] = b"u1,u2,u3\nu1,\n,u3\nu1,u5\"\n\"u4\",\"u1\"\nu4,u1\nu6,u6\n\nu1\nuser_id_a,user_id_b\nu4,user_id_b\n\"A\tB\",user_id_a\n\"\",x\n\"ab\"c,d\na\"b,c\n\"a,b\"\nlongerfieldvalue,anotherlongvalue\r\nlast,line";
+        let mut expect = Vec::new();
+        for l in text.split(|&b| b == b'\n') {
+            if let Some(f) = split::<2>(l) {
+                expect.push(f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(collect::<2>(text), expect);
+        assert_eq!(collect::<2>(b"a,b\n"), vec![vec![b"a".to_vec(), b"b".to_vec()]]);
+        assert_eq!(collect::<3>(b"a,\"\",c\n\"\n"), vec![vec![b"a".to_vec(), b"".to_vec(), b"c".to_vec()]]);
+    }
+
+    #[test]
+    fn scan_fuzz() {
+        let alphabet = b"ab,,\"\"\n\r 0";
+        let mut x: u64 = 12345;
+        for _ in 0..20000 {
+            let mut buf = Vec::new();
+            let len = (x % 40) as usize;
+            for _ in 0..len {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                buf.push(alphabet[((x >> 33) % alphabet.len() as u64) as usize]);
+            }
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let text: &'static [u8] = Box::leak(buf.into_boxed_slice());
+            let mut expect: Vec<Vec<Vec<u8>>> = Vec::new();
+            let body = if text.last() == Some(&b'\n') { &text[..text.len() - 1] } else { text };
+            if !text.is_empty() {
+                for l in body.split(|&b| b == b'\n') {
+                    if let Some(f) = split::<3>(l) {
+                        expect.push(f.iter().map(|x| x.to_vec()).collect());
+                    }
+                }
+            }
+            assert_eq!(collect::<3>(text), expect, "{:?}", String::from_utf8_lossy(text));
+        }
+    }
+}

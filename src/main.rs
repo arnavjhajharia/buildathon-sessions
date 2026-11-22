@@ -7,9 +7,13 @@
 //!   3. dedup events per event_id partition, keep valid winners, scatter by person
 //!   4. per person partition: sort, sessionize, attribute, aggregate
 //!   5. write Parquet, one file per worker
+mod fast;
 mod parquet;
 mod parse;
 mod sys;
+
+#[global_allocator]
+static GLOBAL: sys::Alloc = sys::Alloc;
 
 use parse::{parse_price, parse_ts, split, DAY};
 use std::collections::HashMap;
@@ -325,15 +329,36 @@ fn part(h: u64) -> usize {
 
 struct TooLong;
 
+extern "C" {
+    fn getrusage(who: i32, usage: *mut i64) -> i32;
+}
+
+/// Process CPU time (user + system) in milliseconds.
+fn cpu_ms() -> f64 {
+    let mut u = [0i64; 32];
+    unsafe { getrusage(0, u.as_mut_ptr()) };
+    let tv = |s: i64, us: i64| s as f64 * 1e3 + (us as i32) as f64 / 1e3;
+    tv(u[0], u[1]) + tv(u[2], u[3])
+}
+
 fn timer() -> impl FnMut(&str) {
     let on = std::env::var_os("PROFILE").is_some();
     let t0 = Instant::now();
     let mut last = t0;
+    let mut last_cpu = if on { cpu_ms() } else { 0.0 };
     move |what: &str| {
         if on {
             let now = Instant::now();
-            eprintln!("{:>8.1} ms  {:>8.1} ms  {}", (now - last).as_secs_f64() * 1e3, (now - t0).as_secs_f64() * 1e3, what);
+            let c = cpu_ms();
+            eprintln!(
+                "{:>8.1} ms wall {:>8.1} ms cpu {:>8.1} ms total  {}",
+                (now - last).as_secs_f64() * 1e3,
+                c - last_cpu,
+                (now - t0).as_secs_f64() * 1e3,
+                what
+            );
             last = now;
+            last_cpu = c;
         }
     }
 }
@@ -544,15 +569,6 @@ fn run<K: Key>(inp: &Inputs) -> Result<(), TooLong> {
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
     let ncat = inp.categories.len();
     let next = AtomicUsize::new(0);
-    struct Ud {
-        names: Vec<u8>,
-        days: Vec<i32>,
-        sessions: Vec<i64>,
-        events: Vec<i64>,
-        revenue: Vec<i64>,
-        top: Vec<u8>,
-        present: Vec<bool>,
-    }
     let results: Vec<(Ud, Vec<[i64; 4]>)> = par_map(t, |_| {
         let mut ud = Ud { names: Vec::new(), days: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new(), present: Vec::new() };
         // [campaign][day] -> sessions, purchasing, revenue, assisted
@@ -698,6 +714,28 @@ fn run<K: Key>(inp: &Inputs) -> Result<(), TooLong> {
     });
     tick("sessionize+attribute");
 
+    write_outputs(inp, results, ncamp, ndays, ws_day);
+    tick("write");
+    Ok(())
+}
+
+pub struct Ud {
+    pub names: Vec<u8>,
+    pub days: Vec<i32>,
+    pub sessions: Vec<i64>,
+    pub events: Vec<i64>,
+    pub revenue: Vec<i64>,
+    pub top: Vec<u8>,
+    pub present: Vec<bool>,
+}
+
+impl Ud {
+    pub fn new() -> Self {
+        Ud { names: Vec::new(), days: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top: Vec::new(), present: Vec::new() }
+    }
+}
+
+pub(crate) fn write_outputs(inp: &Inputs, results: Vec<(Ud, Vec<[i64; 4]>)>, ncamp: usize, ndays: usize, ws_day: i64) {
     // ---- write
     let ud_dir = inp.out.join("user_daily");
     let cd_dir = inp.out.join("campaign_daily");
@@ -768,8 +806,6 @@ fn run<K: Key>(inp: &Inputs) -> Result<(), TooLong> {
         ];
         parquet::write(&cd_dir.join("part-000.parquet"), rows, &cols).unwrap();
     });
-    tick("write");
-    Ok(())
 }
 
 fn main() {
@@ -789,6 +825,12 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
     let inp = load(&data, out, threads);
+    let fast_ok = inp.we > inp.ws
+        && inp.we - (inp.ws - WEEK) < u32::MAX as i64
+        && inp.categories.len() <= 256;
+    if fast_ok && fast::run_fast(&inp).is_ok() {
+        std::process::exit(0);
+    }
     if run::<u128>(&inp).is_err() {
         if std::env::var_os("PROFILE").is_some() {
             eprintln!("an ID is longer than 15 bytes: general path");
